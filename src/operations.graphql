@@ -1,0 +1,33 @@
+# SaveModel mutation
+mutation SaveModel {
+  saveModel {
+    message
+  }
+}
+
+# StartOptimization mutation
+mutation StartOptimization {
+  startOptimization
+}
+
+# JobStatus query
+query JobStatus($jobId: Int!) {
+  jobStatus(jobId: $jobId) {
+    state
+    message
+  }
+}
+
+# GetJobOutcome query
+query GetJobOutcome($jobId: Int!) {
+  jobOutcome(jobId: $jobId) {
+    __typename
+    ... on OptimizationOutcome {
+      time
+      controlSignals {
+        name
+        signal
+      }
+    }
+  }
+}
