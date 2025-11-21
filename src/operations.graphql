@@ -22,6 +22,10 @@ query JobStatus($jobId: Int!) {
 query GetJobOutcome($jobId: Int!) {
   jobOutcome(jobId: $jobId) {
     __typename
+    ... on WeatherForecastOutcome {
+      time
+      temperature
+    }
     ... on OptimizationOutcome {
       time
       controlSignals {
@@ -29,5 +33,19 @@ query GetJobOutcome($jobId: Int!) {
         signal
       }
     }
+        ... on ElectricityPriceOutcome {
+      time
+      price
+    }
   }
 }
+
+mutation StartWeatherForecastFetch {
+  startWeatherForecastFetch
+}
+
+# StartElectricityPriceFetch mutation
+mutation StartElectricityPriceFetch {
+  startElectricityPriceFetch
+}
+

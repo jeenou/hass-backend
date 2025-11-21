@@ -31,9 +31,13 @@ const OPERATIONS: &str = include_str!("operations.graphql");
 struct AppState {
     client: Client,
     graphql_url: String,
-    hourly_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    optimization_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    weather_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    price_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    prices_latest: Arc<Mutex<Option<Value>>>,
     ha_base_url: String,
     ha_api_key: Arc<Mutex<Option<String>>>,
+    weather_latest: Arc<Mutex<Option<Value>>>,
 }
 
 // Body for /set-ha-api-key
@@ -289,7 +293,7 @@ async fn hourly_optimization_loop(state: Arc<AppState>) {
 
 // POST /start-hourly-optimization
 async fn start_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let mut guard = state.hourly_task.lock().await;
+    let mut guard = state.optimization_task.lock().await;
 
     if guard.is_some() {
         // Already running
@@ -307,7 +311,7 @@ async fn start_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value>
 
 // POST /stop-hourly-optimization
 async fn stop_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let mut guard = state.hourly_task.lock().await;
+    let mut guard = state.optimization_task.lock().await;
 
     if let Some(handle) = guard.take() {
         handle.abort();
@@ -328,6 +332,296 @@ async fn set_ha_api_key_handler(
     Json(json!({ "status": "ok" }))
 }
 
+async fn start_weather_fetch(client: &Client, graphql_url: &str) -> Result<i64> {
+    let resp = graphql_request(
+        client,
+        graphql_url,
+        OPERATIONS,
+        Some("StartWeatherForecastFetch"),
+        json!({}),
+    )
+    .await?;
+
+    if let Some(errors) = resp.get("errors") {
+        return Err(anyhow!("GraphQL errors in StartWeatherForecastFetch: {errors:#?}"));
+    }
+
+    let job_id = resp
+        .pointer("/data/startWeatherForecastFetch")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("startWeatherForecastFetch did not return a valid jobId"))?;
+
+    println!("[startWeatherFetch] jobId = {job_id}");
+    Ok(job_id)
+}
+
+async fn get_weather_outcome(
+    client: &Client,
+    graphql_url: &str,
+    job_id: i64,
+) -> Result<Option<Value>> {
+    let resp = graphql_request(
+        client,
+        graphql_url,
+        OPERATIONS,
+        Some("GetJobOutcome"),
+        json!({ "jobId": job_id }),
+    )
+    .await?;
+
+    if let Some(errors) = resp.get("errors") {
+        return Err(anyhow!(
+            "GraphQL errors in GetJobOutcome for job {job_id}: {errors:#?}"
+        ));
+    }
+
+    let outcome = resp
+        .pointer("/data/jobOutcome")
+        .ok_or_else(|| anyhow!("jobOutcome missing in response"))?;
+
+    let typename = outcome
+        .pointer("/__typename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+
+    if typename != "WeatherForecastOutcome" {
+        println!(
+            "[weather jobOutcome] jobId={job_id}, unexpected __typename={typename}, ignoring"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(outcome.clone()))
+}
+
+async fn run_weather_cycle(state: &AppState) -> Result<()> {
+    println!("=== Starting weather fetch cycle ===");
+
+    let client = &state.client;
+    let graphql_url = &state.graphql_url;
+
+    // 1) Start weather job
+    let job_id = start_weather_fetch(client, graphql_url).await?;
+
+    // 2) Wait until FINISHED (reuse existing helper)
+    let (final_state, message) = wait_for_job(client, graphql_url, job_id).await?;
+    if final_state != "FINISHED" {
+        return Err(anyhow!(
+            "Weather job {job_id} ended in state {final_state}, message={message:?}"
+        ));
+    }
+
+    // 3) Read outcome
+    if let Some(outcome) = get_weather_outcome(client, graphql_url, job_id).await? {
+        println!("[weatherOutcome] jobId={job_id}, updating latest weather");
+
+        // Just store the raw WeatherForecastOutcome JSON; frontend will shape it
+        let mut guard = state.weather_latest.lock().await;
+        *guard = Some(outcome);
+    } else {
+        println!("[weatherOutcome] jobId={job_id}, no WeatherForecastOutcome");
+    }
+
+    println!("=== Weather fetch cycle complete ===");
+    Ok(())
+}
+
+async fn hourly_weather_loop(state: Arc<AppState>) {
+    // First fetch right away
+    if let Err(e) = run_weather_cycle(&state).await {
+        eprintln!("[weather hourly] first weather fetch failed: {e:?}");
+    }
+
+    let mut ticker = interval(Duration::from_secs(60 * 60));
+    loop {
+        ticker.tick().await;
+        if let Err(e) = run_weather_cycle(&state).await {
+            eprintln!("[weather hourly] weather fetch failed: {e:?}");
+        }
+    }
+}
+
+async fn start_weather_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+
+    let mut guard = state.weather_task.lock().await;
+
+    if guard.is_some() {
+        return Json(json!({ "status": "already_running" }));
+    }
+
+    let state_clone = state.clone();
+    let handle = tokio::spawn(async move {
+        hourly_weather_loop(state_clone).await;
+    });
+
+    *guard = Some(handle);
+    Json(json!({ "status": "started" }))
+}
+
+
+async fn get_weather_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let guard = state.weather_latest.lock().await;
+    if let Some(outcome) = &*guard {
+        // outcome is the WeatherForecastOutcome object:
+        // { "__typename": "WeatherForecastOutcome", "time": [...], "temperature": [...] }
+        Json(json!({
+            "status": "ok",
+            "data": outcome,
+        }))
+    } else {
+        Json(json!({
+            "status": "no_data",
+        }))
+    }
+}
+
+async fn start_price_fetch(client: &Client, graphql_url: &str) -> Result<i64> {
+    let resp = graphql_request(
+        client,
+        graphql_url,
+        OPERATIONS,
+        Some("StartElectricityPriceFetch"),
+        json!({}),
+    )
+    .await?;
+
+    if let Some(errors) = resp.get("errors") {
+        return Err(anyhow!(
+            "GraphQL errors in StartElectricityPriceFetch: {errors:#?}"
+        ));
+    }
+
+    let job_id = resp
+        .pointer("/data/startElectricityPriceFetch")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("startElectricityPriceFetch did not return a valid jobId"))?;
+
+    println!("[startPriceFetch] jobId = {job_id}");
+    Ok(job_id)
+}
+
+async fn get_price_outcome(
+    client: &Client,
+    graphql_url: &str,
+    job_id: i64,
+) -> Result<Option<Value>> {
+    let resp = graphql_request(
+        client,
+        graphql_url,
+        OPERATIONS,
+        Some("GetJobOutcome"),
+        json!({ "jobId": job_id }),
+    )
+    .await?;
+
+    if let Some(errors) = resp.get("errors") {
+        return Err(anyhow!(
+            "GraphQL errors in GetJobOutcome for price job {job_id}: {errors:#?}"
+        ));
+    }
+
+    let outcome = resp
+        .pointer("/data/jobOutcome")
+        .ok_or_else(|| anyhow!("jobOutcome missing in response"))?;
+
+    let typename = outcome
+        .pointer("/__typename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+
+    if typename != "ElectricityPriceOutcome" {
+        println!(
+            "[price jobOutcome] jobId={job_id}, unexpected __typename={typename}, ignoring"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(outcome.clone()))
+}
+
+async fn run_price_cycle(state: &AppState) -> Result<()> {
+    println!("=== Starting electricity price fetch cycle ===");
+
+    let client = &state.client;
+    let graphql_url = &state.graphql_url;
+
+    // 1) Start electricity price job
+    let job_id = start_price_fetch(client, graphql_url).await?;
+
+    // 2) Wait until FINISHED
+    let (final_state, message) = wait_for_job(client, graphql_url, job_id).await?;
+    if final_state != "FINISHED" {
+        return Err(anyhow!(
+            "Electricity price job {job_id} ended in state {final_state}, message={message:?}"
+        ));
+    }
+
+    // 3) Read outcome
+    if let Some(outcome) = get_price_outcome(client, graphql_url, job_id).await? {
+        println!("[priceOutcome] jobId={job_id}, updating latest prices");
+
+        // Store the raw ElectricityPriceOutcome JSON
+        let mut guard = state.prices_latest.lock().await;
+        *guard = Some(outcome);
+    } else {
+        println!("[priceOutcome] jobId={job_id}, no ElectricityPriceOutcome");
+    }
+
+    println!("=== Electricity price fetch cycle complete ===");
+    Ok(())
+}
+
+async fn hourly_price_loop(state: Arc<AppState>) {
+    // First fetch right away
+    if let Err(e) = run_price_cycle(&state).await {
+        eprintln!("[price hourly] first price fetch failed: {e:?}");
+    }
+
+    let mut ticker = interval(Duration::from_secs(60 * 60));
+    loop {
+        ticker.tick().await;
+        if let Err(e) = run_price_cycle(&state).await {
+            eprintln!("[price hourly] price fetch failed: {e:?}");
+        }
+    }
+}
+
+// POST /start-prices
+async fn start_price_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let mut guard = state.price_task.lock().await;
+
+    if guard.is_some() {
+        return Json(json!({ "status": "already_running" }));
+    }
+
+    let state_clone = state.clone();
+    let handle = tokio::spawn(async move {
+        hourly_price_loop(state_clone).await;
+    });
+
+    *guard = Some(handle);
+    Json(json!({ "status": "started" }))
+}
+
+// POST /prices
+async fn get_prices_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let guard = state.prices_latest.lock().await;
+    if let Some(outcome) = &*guard {
+        // outcome is the ElectricityPriceOutcome object:
+        // { "__typename": "ElectricityPriceOutcome", "time": [...], "price": [...] }
+        Json(json!({
+            "status": "ok",
+            "data": outcome,
+        }))
+    } else {
+        Json(json!({
+            "status": "no_data",
+        }))
+    }
+}
+
+
+
 // ---------------- main ----------------
 
 #[tokio::main]
@@ -344,9 +638,13 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         client,
         graphql_url,
-        hourly_task: Arc::new(Mutex::new(None)),
+        optimization_task: Arc::new(Mutex::new(None)),
+        weather_task: Arc::new(Mutex::new(None)),
+        price_task: Arc::new(Mutex::new(None)),
+        prices_latest: Arc::new(Mutex::new(None)),
         ha_base_url,
         ha_api_key: Arc::new(Mutex::new(None)),
+        weather_latest: Arc::new(Mutex::new(None)),
     });
 
     let cors = CorsLayer::new()
@@ -362,6 +660,10 @@ async fn main() -> Result<()> {
         .route("/start-hourly-optimization", post(start_hourly_handler))
         .route("/stop-hourly-optimization", post(stop_hourly_handler))
         .route("/set-ha-api-key", post(set_ha_api_key_handler))
+        .route("/weather", post(get_weather_handler))
+        .route("/start-weather", post(start_weather_handler))
+        .route("/prices", post(get_prices_handler))
+        .route("/start-prices", post(start_price_handler))
         .with_state(state)
         .layer(cors);
 
