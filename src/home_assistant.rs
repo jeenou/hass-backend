@@ -1,7 +1,7 @@
 // src/home_assistant.rs
 
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 
 /// Valid HA domains we support.
@@ -53,6 +53,31 @@ pub fn extract_entity_id(name: &str) -> String {
     } else {
         String::new()
     }
+}
+
+/// Fetch the current state of a Home Assistant entity by its entity_id.
+/// Wraps the HA REST API: GET /api/states/{entity_id}
+pub async fn fetch_entity_state(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    entity_id: &str,
+) -> Result<Value, reqwest::Error> {
+    let url = format!(
+        "{}/states/{}",
+        base_url.trim_end_matches('/'),
+        entity_id
+    );
+
+    let resp = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await?
+        .error_for_status()?; // propagate non-2xx as errors
+
+    let body = resp.json::<Value>().await?;
+    Ok(body)
 }
 
 /// Send a single control signal to Home Assistant using REST API.

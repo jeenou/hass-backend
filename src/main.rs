@@ -9,9 +9,9 @@ use home_assistant::*; // extract_entity_id, send_control_signal
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::State,
+    extract::{State, Path},
     http::{HeaderValue, Method},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use reqwest::Client;
@@ -277,6 +277,44 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
 
 // ---------------- Hourly loop + HTTP handlers ----------------
 
+// GET /ha-state/:entity_id  -> fetch state of any Home Assistant entity
+async fn ha_state_handler(
+    State(state): State<Arc<AppState>>,
+    Path(entity_id): Path<String>,
+) -> Json<Value> {
+
+    let api_key_opt = {
+        let guard = state.ha_api_key.lock().await;
+        guard.clone()
+    };
+
+    if api_key_opt.is_none() {
+        return Json(json!({
+            "status": "error",
+            "message": "No Home Assistant API key set. Call /set-ha-api-key first."
+        }));
+    }
+
+    let api_key = api_key_opt.unwrap();
+
+    match fetch_entity_state(&state.client, &state.ha_base_url, &api_key, &entity_id).await {
+        Ok(state_json) => Json(json!({
+            "status": "ok",
+            "entity_id": entity_id,
+            "data": state_json
+        })),
+        Err(e) => {
+            eprintln!("[HA] error fetching state for {}: {}", entity_id, e);
+            Json(json!({
+                "status": "error",
+                "entity_id": entity_id,
+                "message": e.to_string()
+            }))
+        }
+    }
+}
+
+
 async fn hourly_optimization_loop(state: Arc<AppState>) {
     if let Err(e) = run_one_cycle(&state).await {
         eprintln!("[hourly] first optimisation failed: {e:?}");
@@ -400,10 +438,9 @@ async fn run_weather_cycle(state: &AppState) -> Result<()> {
     let client = &state.client;
     let graphql_url = &state.graphql_url;
 
-    // 1) Start weather job
+
     let job_id = start_weather_fetch(client, graphql_url).await?;
 
-    // 2) Wait until FINISHED (reuse existing helper)
     let (final_state, message) = wait_for_job(client, graphql_url, job_id).await?;
     if final_state != "FINISHED" {
         return Err(anyhow!(
@@ -653,7 +690,7 @@ async fn main() -> Result<()> {
                 .parse::<HeaderValue>()
                 .expect("invalid CORS origin"),
         )
-        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(tower_http::cors::Any);
 
     let app = Router::new()
@@ -664,6 +701,7 @@ async fn main() -> Result<()> {
         .route("/start-weather", post(start_weather_handler))
         .route("/prices", post(get_prices_handler))
         .route("/start-prices", post(start_price_handler))
+        .route("/ha-state/{entity_id}", get(ha_state_handler))
         .with_state(state)
         .layer(cors);
 
