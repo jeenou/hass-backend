@@ -17,7 +17,7 @@ use axum::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tokio::{
     net::TcpListener,
     sync::Mutex,
@@ -685,13 +685,9 @@ async fn main() -> Result<()> {
     });
 
     let cors = CorsLayer::new()
-        .allow_origin(
-            "http://localhost:3000"
-                .parse::<HeaderValue>()
-                .expect("invalid CORS origin"),
-        )
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers(tower_http::cors::Any);
+    .allow_origin(Any)
+    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+    .allow_headers(Any);
 
     let app = Router::new()
         .route("/start-hourly-optimization", post(start_hourly_handler))
