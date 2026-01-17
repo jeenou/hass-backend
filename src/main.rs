@@ -10,20 +10,21 @@ use home_assistant::*; // extract_entity_id, send_control_signal
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{State, Path},
-    http::{HeaderValue, Method},
+    http::Method,
     routing::{get, post},
-    Json, Router,
+    Json, Router, response::IntoResponse
 };
 use reqwest::Client;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 use tokio::{
     net::TcpListener,
     sync::Mutex,
     task::JoinHandle,
     time::{interval, sleep},
 };
+use std::path::Path as StdPath;
 
 const OPERATIONS: &str = include_str!("operations.graphql");
 
@@ -36,14 +37,15 @@ struct AppState {
     price_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     prices_latest: Arc<Mutex<Option<Value>>>,
     ha_base_url: String,
-    ha_api_key: Arc<Mutex<Option<String>>>,
+    ha_token: String,
     weather_latest: Arc<Mutex<Option<Value>>>,
 }
 
-// Body for /set-ha-api-key
-#[derive(Deserialize)]
-struct HaApiKeyRequest {
-    api_key: String,
+async fn spa_fallback() -> impl IntoResponse {
+    axum::response::Html(
+        std::fs::read_to_string("/web/index.html")
+            .unwrap_or_else(|_| "<h1>UI not found</h1><p>/web/index.html missing</p>".to_string()),
+    )
 }
 
 // ---------------- GraphQL helpers ----------------
@@ -230,41 +232,38 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
         );
 
         // ----- Send to Home Assistant -----
-        let api_key_opt = {
-            let guard = state.ha_api_key.lock().await;
-            guard.clone()
-        };
+        // New AppState: token is always available (read from env in main, passed into AppState)
+        let api_key = &state.ha_token;
+        let base_url = &state.ha_base_url;
 
-        if let Some(api_key) = api_key_opt {
-            if let Some(arr) = cs.as_array() {
-                for sig in arr {
-                    let name = sig.get("name").and_then(|v| v.as_str());
-                    let values = sig.get("signal").and_then(|v| v.as_array());
-                    if name.is_none() || values.is_none() {
-                        continue;
-                    }
-                    let entity_id = extract_entity_id(name.unwrap());
-                    if entity_id.is_empty() {
-                        continue;
-                    }
-                    if let Some(first_value) = values.unwrap().get(0).and_then(|v| v.as_f64()) {
-                        println!("[HA] Sending {first_value} to {entity_id}");
-                        if let Err(e) = send_control_signal(
-                            &state.client,
-                            &state.ha_base_url,
-                            &api_key,
-                            &entity_id,
-                            first_value,
-                        )
-                        .await
-                        {
-                            eprintln!("[HA] error sending to {}: {}", entity_id, e);
-                        }
+        if let Some(arr) = cs.as_array() {
+            for sig in arr {
+                let name = sig.get("name").and_then(|v| v.as_str());
+                let values = sig.get("signal").and_then(|v| v.as_array());
+                if name.is_none() || values.is_none() {
+                    continue;
+                }
+
+                let entity_id = extract_entity_id(name.unwrap());
+                if entity_id.is_empty() {
+                    continue;
+                }
+
+                if let Some(first_value) = values.unwrap().get(0).and_then(|v| v.as_f64()) {
+                    println!("[HA] Sending {first_value} to {entity_id}");
+                    if let Err(e) = send_control_signal(
+                        &state.client,
+                        base_url,
+                        api_key,
+                        &entity_id,
+                        first_value,
+                    )
+                    .await
+                    {
+                        eprintln!("[HA] error sending to {}: {}", entity_id, e);
                     }
                 }
             }
-        } else {
-            println!("[HA] No API key set; skipping sending control signals");
         }
         // -----------------------------------
     } else {
@@ -282,22 +281,10 @@ async fn ha_state_handler(
     State(state): State<Arc<AppState>>,
     Path(entity_id): Path<String>,
 ) -> Json<Value> {
+    let api_key = &state.ha_token;
+    let base_url = &state.ha_base_url;
 
-    let api_key_opt = {
-        let guard = state.ha_api_key.lock().await;
-        guard.clone()
-    };
-
-    if api_key_opt.is_none() {
-        return Json(json!({
-            "status": "error",
-            "message": "No Home Assistant API key set. Call /set-ha-api-key first."
-        }));
-    }
-
-    let api_key = api_key_opt.unwrap();
-
-    match fetch_entity_state(&state.client, &state.ha_base_url, &api_key, &entity_id).await {
+    match fetch_entity_state(&state.client, base_url, api_key, &entity_id).await {
         Ok(state_json) => Json(json!({
             "status": "ok",
             "entity_id": entity_id,
@@ -313,6 +300,7 @@ async fn ha_state_handler(
         }
     }
 }
+
 
 
 async fn hourly_optimization_loop(state: Arc<AppState>) {
@@ -357,17 +345,6 @@ async fn stop_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value> 
     }
 
     Json(json!({ "status": "not_running" }))
-}
-
-// POST /set-ha-api-key  { "api_key": "..." }
-async fn set_ha_api_key_handler(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<HaApiKeyRequest>,
-) -> Json<Value> {
-    let mut guard = state.ha_api_key.lock().await;
-    *guard = Some(payload.api_key);
-    println!("[HA] API key updated");
-    Json(json!({ "status": "ok" }))
 }
 
 async fn start_weather_fetch(client: &Client, graphql_url: &str) -> Result<i64> {
@@ -666,9 +643,11 @@ async fn main() -> Result<()> {
     let graphql_url = std::env::var("HERTTA_GRAPHQL_URL")
         .unwrap_or_else(|_| "http://localhost:3030/graphql".to_string());
 
-    // Home Assistant base URL (env or default)
     let ha_base_url = std::env::var("HASS_BASE_URL")
-        .unwrap_or_else(|_| "http://192.168.1.110:8123/api".to_string());
+        .unwrap_or_else(|_| "http://supervisor/core/api".to_string());
+
+    let ha_token = std::env::var("HASS_TOKEN")
+        .map_err(|_| anyhow!("HASS_TOKEN not set (export it from run.sh)"))?;
 
     let client = Client::new();
 
@@ -680,19 +659,18 @@ async fn main() -> Result<()> {
         price_task: Arc::new(Mutex::new(None)),
         prices_latest: Arc::new(Mutex::new(None)),
         ha_base_url,
-        ha_api_key: Arc::new(Mutex::new(None)),
+        ha_token,
         weather_latest: Arc::new(Mutex::new(None)),
     });
 
     let cors = CorsLayer::new()
-    .allow_origin(Any)
-    .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-    .allow_headers(Any);
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/start-hourly-optimization", post(start_hourly_handler))
         .route("/stop-hourly-optimization", post(stop_hourly_handler))
-        .route("/set-ha-api-key", post(set_ha_api_key_handler))
         .route("/weather", post(get_weather_handler))
         .route("/start-weather", post(start_weather_handler))
         .route("/prices", post(get_prices_handler))
@@ -700,6 +678,17 @@ async fn main() -> Result<()> {
         .route("/ha-state/{entity_id}", get(ha_state_handler))
         .with_state(state)
         .layer(cors);
+
+    // Serve CRA frontend from /web (copied by Dockerfile)
+    let web_dir = "/web";
+    if StdPath::new(web_dir).exists() {
+        app = app.fallback_service(
+            ServeDir::new(web_dir).fallback(axum::routing::get(spa_fallback)),
+        );
+        println!("[UI] Serving frontend from {web_dir}");
+    } else {
+        println!("[UI] {web_dir} not found; UI will not be served");
+    }
 
     let addr: SocketAddr = "0.0.0.0:4001".parse().unwrap();
     println!("Hass backend listening on {addr}");
@@ -709,3 +698,4 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow!(e))
 }
+
