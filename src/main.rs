@@ -302,6 +302,96 @@ async fn ha_state_handler(
 }
 
 
+<<<<<<< Updated upstream
+=======
+    match state
+        .client
+        .get(url)
+        .bearer_auth(&state.ha_token)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.json::<Value>().await.unwrap_or_else(|_| {
+                json!({
+                    "message": "Home Assistant returned a non-JSON response"
+                })
+            });
+
+            (status, Json(body))
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "message": err.to_string()
+            })),
+        ),
+    }
+}
+
+async fn ha_states_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let url = format!("{}/states", state.ha_base_url.trim_end_matches('/'));
+
+    match state
+        .client
+        .get(url)
+        .bearer_auth(&state.ha_token)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.json::<Value>().await.unwrap_or_else(|_| {
+                json!({
+                    "message": "Home Assistant returned a non-JSON response"
+                })
+            });
+
+            (status, Json(body))
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "message": err.to_string()
+            })),
+        ),
+    }
+}
+
+async fn set_ha_api_key_handler() -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "message": "Use HASS_TOKEN when starting the container to set the Home Assistant token."
+    }))
+}
+
+async fn hertta_health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let health_url = state.graphql_url.trim_end_matches("/graphql").to_string() + "/health";
+
+    match state.client.get(health_url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_else(|_| String::new());
+
+            (
+                status,
+                Json(json!({
+                    "status": if status.is_success() { "ok" } else { "error" },
+                    "body": text,
+                })),
+            )
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "status": "error",
+                "message": err.to_string(),
+            })),
+        ),
+    }
+}
+>>>>>>> Stashed changes
 
 async fn hourly_optimization_loop(state: Arc<AppState>) {
     if let Err(e) = run_one_cycle(&state).await {
@@ -447,6 +537,7 @@ async fn hourly_weather_loop(state: Arc<AppState>) {
     }
 
     let mut ticker = interval(Duration::from_secs(60 * 60));
+    ticker.tick().await;
     loop {
         ticker.tick().await;
         if let Err(e) = run_weather_cycle(&state).await {
@@ -460,7 +551,14 @@ async fn start_weather_handler(State(state): State<Arc<AppState>>) -> Json<Value
     let mut guard = state.weather_task.lock().await;
 
     if guard.is_some() {
-        return Json(json!({ "status": "already_running" }));
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_weather_cycle(&state_clone).await {
+                eprintln!("[weather refresh] weather fetch failed: {e:?}");
+            }
+        });
+
+        return Json(json!({ "status": "already_running_refresh_started" }));
     }
 
     let state_clone = state.clone();
