@@ -10,7 +10,7 @@ use home_assistant::*; // extract_entity_id, send_control_signal
 use anyhow::{anyhow, Result};
 use axum::{
     extract::{State, Path},
-    http::Method,
+    http::{Method, StatusCode},
     routing::{get, post},
     Json, Router, response::IntoResponse
 };
@@ -36,6 +36,7 @@ struct AppState {
     weather_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     price_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     prices_latest: Arc<Mutex<Option<Value>>>,
+    control_signals_latest: Arc<Mutex<Option<Value>>>,
     ha_base_url: String,
     ha_token: String,
     weather_latest: Arc<Mutex<Option<Value>>>,
@@ -74,6 +75,29 @@ async fn graphql_request(
         .error_for_status()?;
 
     Ok(resp.json::<Value>().await?)
+}
+
+async fn graphql_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> impl IntoResponse {
+    match state.client.post(&state.graphql_url).json(&payload).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = resp.json::<Value>().await.unwrap_or_else(|_| {
+                json!({
+                    "errors": [{ "message": "Hertta returned a non-JSON response" }]
+                })
+            });
+            (status, Json(body))
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "errors": [{ "message": err.to_string() }]
+            })),
+        ),
+    }
 }
 
 async fn save_model(client: &Client, graphql_url: &str) -> Result<()> {
@@ -121,6 +145,8 @@ async fn wait_for_job(
     let poll_interval = Duration::from_secs(2);
     let max_attempts = 300; // ~10 minutes
 
+    println!("[jobStatus] waiting for jobId={job_id}");
+
     for attempt in 1..=max_attempts {
         let resp = graphql_request(
             client,
@@ -148,12 +174,11 @@ async fn wait_for_job(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        println!(
-            "[jobStatus] attempt {attempt}, jobId={job_id}, state={state}, message={:?}",
-            message
-        );
-
         if state == "FINISHED" || state == "FAILED" {
+            println!(
+                "[jobStatus] jobId={job_id}, state={state}, attempts={attempt}, message={:?}",
+                message
+            );
             return Ok((state, message));
         }
 
@@ -231,6 +256,11 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
             cs.as_array().map(|a| a.len()).unwrap_or(0)
         );
 
+        if cs.as_array().is_some_and(|signals| !signals.is_empty()) {
+            let mut guard = state.control_signals_latest.lock().await;
+            *guard = Some(cs.clone());
+        }
+
         // ----- Send to Home Assistant -----
         // New AppState: token is always available (read from env in main, passed into AppState)
         let api_key = &state.ha_token;
@@ -301,9 +331,9 @@ async fn ha_state_handler(
     }
 }
 
+async fn ha_api_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let url = format!("{}/", state.ha_base_url.trim_end_matches('/'));
 
-<<<<<<< Updated upstream
-=======
     match state
         .client
         .get(url)
@@ -391,7 +421,6 @@ async fn hertta_health_handler(State(state): State<Arc<AppState>>) -> impl IntoR
         ),
     }
 }
->>>>>>> Stashed changes
 
 async fn hourly_optimization_loop(state: Arc<AppState>) {
     if let Err(e) = run_one_cycle(&state).await {
@@ -435,6 +464,20 @@ async fn stop_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value> 
     }
 
     Json(json!({ "status": "not_running" }))
+}
+
+async fn get_control_signals_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let guard = state.control_signals_latest.lock().await;
+    if let Some(control_signals) = &*guard {
+        Json(json!({
+            "status": "ok",
+            "data": control_signals,
+        }))
+    } else {
+        Json(json!({
+            "status": "no_data",
+        }))
+    }
 }
 
 async fn start_weather_fetch(client: &Client, graphql_url: &str) -> Result<i64> {
@@ -756,6 +799,7 @@ async fn main() -> Result<()> {
         weather_task: Arc::new(Mutex::new(None)),
         price_task: Arc::new(Mutex::new(None)),
         prices_latest: Arc::new(Mutex::new(None)),
+        control_signals_latest: Arc::new(Mutex::new(None)),
         ha_base_url,
         ha_token,
         weather_latest: Arc::new(Mutex::new(None)),
@@ -767,13 +811,19 @@ async fn main() -> Result<()> {
         .allow_headers(Any);
 
     let mut app = Router::new()
+        .route("/graphql", post(graphql_proxy_handler))
         .route("/start-hourly-optimization", post(start_hourly_handler))
         .route("/stop-hourly-optimization", post(stop_hourly_handler))
+        .route("/control-signals", get(get_control_signals_handler))
         .route("/weather", post(get_weather_handler))
         .route("/start-weather", post(start_weather_handler))
         .route("/prices", post(get_prices_handler))
         .route("/start-prices", post(start_price_handler))
+        .route("/ha-api", get(ha_api_handler))
         .route("/ha-state/{entity_id}", get(ha_state_handler))
+        .route("/ha-states", get(ha_states_handler))
+        .route("/set-ha-api-key", post(set_ha_api_key_handler))
+        .route("/hertta-health", get(hertta_health_handler))
         .with_state(state)
         .layer(cors);
 

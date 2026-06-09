@@ -2,7 +2,6 @@
 
 use reqwest::Client;
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 /// Valid HA domains we support.
 static VALID_DOMAINS: &[&str] = &["switch", "light", "climate", "number", "fan", "cover"];
@@ -134,34 +133,4 @@ pub async fn send_control_signal(
         eprintln!("Home Assistant error for {}: {}", entity_id, e);
     }
     Ok(())
-}
-
-/// Sends all control signals (first hourly value only) to Home Assistant.
-pub async fn send_control_signals_to_ha(
-    client: &Client,
-    base_url: &str,
-    api_key: &str,
-    control_signals: &serde_json::Value,
-) {
-    let Some(arr) = control_signals.as_array() else {
-        return;
-    };
-
-    for sig in arr {
-        let name = sig.get("name").and_then(|v| v.as_str());
-        let values = sig.get("signal").and_then(|v| v.as_array());
-        if name.is_none() || values.is_none() {
-            continue;
-        }
-
-        let entity_id = extract_entity_id(name.unwrap());
-        if entity_id.is_empty() {
-            continue;
-        }
-
-        if let Some(first_value) = values.unwrap().get(0).and_then(|v| v.as_f64()) {
-            println!("[HA] Sending {} → {}", entity_id, first_value);
-            let _ = send_control_signal(client, base_url, api_key, &entity_id, first_value).await;
-        }
-    }
 }
