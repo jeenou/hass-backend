@@ -33,6 +33,7 @@ struct AppState {
     client: Client,
     graphql_url: String,
     optimization_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    optimization_cycle: Arc<Mutex<()>>,
     weather_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     price_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     prices_latest: Arc<Mutex<Option<Value>>>,
@@ -226,12 +227,12 @@ async fn get_optimization_outcome(
         return Ok(None);
     }
 
-    let control_signals = outcome.pointer("/controlSignals").cloned();
-    Ok(control_signals)
+    Ok(Some(outcome.clone()))
 }
 
 /// One full optimisation cycle + send signals to HA.
 async fn run_one_cycle(state: &AppState) -> Result<()> {
+    let _cycle_guard = state.optimization_cycle.lock().await;
     println!("=== Starting optimisation cycle ===");
 
     let client = &state.client;
@@ -248,9 +249,13 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
         ));
     }
 
-    let control_signals = get_optimization_outcome(client, graphql_url, job_id).await?;
+    let optimization_outcome = get_optimization_outcome(client, graphql_url, job_id).await?;
 
-    if let Some(cs) = control_signals {
+    if let Some(outcome) = optimization_outcome {
+        let cs = outcome
+            .pointer("/controlSignals")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
         println!(
             "[jobOutcome] jobId={job_id}, received {} control signals",
             cs.as_array().map(|a| a.len()).unwrap_or(0)
@@ -258,7 +263,7 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
 
         if cs.as_array().is_some_and(|signals| !signals.is_empty()) {
             let mut guard = state.control_signals_latest.lock().await;
-            *guard = Some(cs.clone());
+            *guard = Some(outcome);
         }
 
         // ----- Send to Home Assistant -----
@@ -428,6 +433,7 @@ async fn hourly_optimization_loop(state: Arc<AppState>) {
     }
 
     let mut ticker = interval(Duration::from_secs(60 * 60));
+    ticker.tick().await;
     loop {
         ticker.tick().await;
         if let Err(e) = run_one_cycle(&state).await {
@@ -464,6 +470,24 @@ async fn stop_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value> 
     }
 
     Json(json!({ "status": "not_running" }))
+}
+
+// POST /refresh-optimization
+async fn refresh_optimization_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let guard = state.optimization_task.lock().await;
+    if guard.is_none() {
+        return Json(json!({ "status": "not_running" }));
+    }
+    drop(guard);
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_one_cycle(&state_clone).await {
+            eprintln!("[refresh] optimisation failed: {e:?}");
+        }
+    });
+
+    Json(json!({ "status": "refresh_started" }))
 }
 
 async fn get_control_signals_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -574,9 +598,11 @@ async fn run_weather_cycle(state: &AppState) -> Result<()> {
 }
 
 async fn hourly_weather_loop(state: Arc<AppState>) {
-    // First fetch right away
-    if let Err(e) = run_weather_cycle(&state).await {
-        eprintln!("[weather hourly] first weather fetch failed: {e:?}");
+    let has_weather_data = state.weather_latest.lock().await.is_some();
+    if !has_weather_data {
+        if let Err(e) = run_weather_cycle(&state).await {
+            eprintln!("[weather hourly] first weather fetch failed: {e:?}");
+        }
     }
 
     let mut ticker = interval(Duration::from_secs(60 * 60));
@@ -590,18 +616,10 @@ async fn hourly_weather_loop(state: Arc<AppState>) {
 }
 
 async fn start_weather_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
-
     let mut guard = state.weather_task.lock().await;
 
     if guard.is_some() {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_weather_cycle(&state_clone).await {
-                eprintln!("[weather refresh] weather fetch failed: {e:?}");
-            }
-        });
-
-        return Json(json!({ "status": "already_running_refresh_started" }));
+        return Json(json!({ "status": "already_running" }));
     }
 
     let state_clone = state.clone();
@@ -796,6 +814,7 @@ async fn main() -> Result<()> {
         client,
         graphql_url,
         optimization_task: Arc::new(Mutex::new(None)),
+        optimization_cycle: Arc::new(Mutex::new(())),
         weather_task: Arc::new(Mutex::new(None)),
         price_task: Arc::new(Mutex::new(None)),
         prices_latest: Arc::new(Mutex::new(None)),
@@ -814,6 +833,7 @@ async fn main() -> Result<()> {
         .route("/graphql", post(graphql_proxy_handler))
         .route("/start-hourly-optimization", post(start_hourly_handler))
         .route("/stop-hourly-optimization", post(stop_hourly_handler))
+        .route("/refresh-optimization", post(refresh_optimization_handler))
         .route("/control-signals", get(get_control_signals_handler))
         .route("/weather", post(get_weather_handler))
         .route("/start-weather", post(start_weather_handler))
