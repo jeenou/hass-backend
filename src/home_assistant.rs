@@ -15,7 +15,12 @@ pub fn extract_entity_id(name: &str) -> String {
 
     let marker = "_electricitygrid";
     if let Some(idx) = name.find(marker) {
-        let entity_id = &name[..idx];
+        let process_name = &name[..idx];
+        let entity_id = process_name
+            .strip_suffix("_cooling_power")
+            .or_else(|| process_name.strip_suffix("_cooling"))
+            .or_else(|| process_name.strip_suffix("_heating"))
+            .unwrap_or(process_name);
         let domain = entity_id.split('.').next().unwrap_or("");
         if VALID_DOMAINS.contains(&domain) {
             return entity_id.to_string();

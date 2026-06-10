@@ -272,6 +272,8 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
         let base_url = &state.ha_base_url;
 
         if let Some(arr) = cs.as_array() {
+            let mut device_signals = std::collections::HashMap::<String, f64>::new();
+
             for sig in arr {
                 let name = sig.get("name").and_then(|v| v.as_str());
                 let values = sig.get("signal").and_then(|v| v.as_array());
@@ -279,24 +281,33 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
                     continue;
                 }
 
-                let entity_id = extract_entity_id(name.unwrap());
+                let signal_name = name.unwrap();
+                if !signal_name.contains("_electricitygrid_") {
+                    continue;
+                }
+
+                let entity_id = extract_entity_id(signal_name);
                 if entity_id.is_empty() {
                     continue;
                 }
 
                 if let Some(first_value) = values.unwrap().get(0).and_then(|v| v.as_f64()) {
-                    println!("[HA] Sending {first_value} to {entity_id}");
-                    if let Err(e) = send_control_signal(
-                        &state.client,
-                        base_url,
-                        api_key,
-                        &entity_id,
-                        first_value,
-                    )
-                    .await
-                    {
-                        eprintln!("[HA] error sending to {}: {}", entity_id, e);
-                    }
+                    *device_signals.entry(entity_id).or_insert(0.0) += first_value;
+                }
+            }
+
+            for (entity_id, value) in device_signals {
+                println!("[HA] Sending {value} to {entity_id}");
+                if let Err(e) = send_control_signal(
+                    &state.client,
+                    base_url,
+                    api_key,
+                    &entity_id,
+                    value,
+                )
+                .await
+                {
+                    eprintln!("[HA] error sending to {}: {}", entity_id, e);
                 }
             }
         }
@@ -598,20 +609,18 @@ async fn run_weather_cycle(state: &AppState) -> Result<()> {
 }
 
 async fn hourly_weather_loop(state: Arc<AppState>) {
-    let has_weather_data = state.weather_latest.lock().await.is_some();
-    if !has_weather_data {
-        if let Err(e) = run_weather_cycle(&state).await {
-            eprintln!("[weather hourly] first weather fetch failed: {e:?}");
-        }
-    }
-
-    let mut ticker = interval(Duration::from_secs(60 * 60));
-    ticker.tick().await;
     loop {
-        ticker.tick().await;
         if let Err(e) = run_weather_cycle(&state).await {
             eprintln!("[weather hourly] weather fetch failed: {e:?}");
         }
+
+        let has_weather_data = state.weather_latest.lock().await.is_some();
+        let delay = if has_weather_data {
+            Duration::from_secs(60 * 60)
+        } else {
+            Duration::from_secs(30)
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
