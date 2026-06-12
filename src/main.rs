@@ -144,11 +144,11 @@ async fn wait_for_job(
     client: &Client,
     graphql_url: &str,
     job_id: i64,
+    max_attempts: u32,
 ) -> Result<(String, Option<String>)> {
     let poll_interval = Duration::from_secs(2);
-    let max_attempts = 300; // ~10 minutes
 
-    println!("[jobStatus] waiting for jobId={job_id}");
+    println!("[jobStatus] waiting for jobId={job_id}, maxAttempts={max_attempts}");
 
     for attempt in 1..=max_attempts {
         let resp = graphql_request(
@@ -244,7 +244,9 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
 
     let job_id = start_optimization(client, graphql_url).await?;
 
-    let (final_state, message) = wait_for_job(client, graphql_url, job_id).await?;
+    // The first Julia/Predicer run on slower hardware can take considerably
+    // longer than forecast jobs, especially while package code is warming up.
+    let (final_state, message) = wait_for_job(client, graphql_url, job_id, 1800).await?;
     if final_state != "FINISHED" {
         return Err(anyhow!(
             "Job {job_id} ended in state {final_state}, message={message:?}"
@@ -588,7 +590,7 @@ async fn run_weather_cycle(state: &AppState) -> Result<()> {
 
     let job_id = start_weather_fetch(client, graphql_url).await?;
 
-    let (final_state, message) = wait_for_job(client, graphql_url, job_id).await?;
+    let (final_state, message) = wait_for_job(client, graphql_url, job_id, 300).await?;
     if final_state != "FINISHED" {
         return Err(anyhow!(
             "Weather job {job_id} ended in state {final_state}, message={message:?}"
@@ -737,7 +739,7 @@ async fn run_price_cycle(state: &AppState) -> Result<()> {
     let job_id = start_price_fetch(client, graphql_url).await?;
 
     // 2) Wait until FINISHED
-    let (final_state, message) = wait_for_job(client, graphql_url, job_id).await?;
+    let (final_state, message) = wait_for_job(client, graphql_url, job_id, 300).await?;
     if final_state != "FINISHED" {
         return Err(anyhow!(
             "Electricity price job {job_id} ended in state {final_state}, message={message:?}"
