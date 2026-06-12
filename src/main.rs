@@ -37,10 +37,12 @@ struct AppState {
     weather_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     price_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     prices_latest: Arc<Mutex<Option<Value>>>,
+    prices_error_latest: Arc<Mutex<Option<String>>>,
     control_signals_latest: Arc<Mutex<Option<Value>>>,
     ha_base_url: String,
     ha_token: String,
     weather_latest: Arc<Mutex<Option<Value>>>,
+    weather_error_latest: Arc<Mutex<Option<String>>>,
 }
 
 async fn spa_fallback() -> impl IntoResponse {
@@ -600,6 +602,7 @@ async fn run_weather_cycle(state: &AppState) -> Result<()> {
         // Just store the raw WeatherForecastOutcome JSON; frontend will shape it
         let mut guard = state.weather_latest.lock().await;
         *guard = Some(outcome);
+        *state.weather_error_latest.lock().await = None;
     } else {
         println!("[weatherOutcome] jobId={job_id}, no WeatherForecastOutcome");
     }
@@ -612,6 +615,7 @@ async fn hourly_weather_loop(state: Arc<AppState>) {
     loop {
         if let Err(e) = run_weather_cycle(&state).await {
             eprintln!("[weather hourly] weather fetch failed: {e:?}");
+            *state.weather_error_latest.lock().await = Some(e.to_string());
         }
 
         let has_weather_data = state.weather_latest.lock().await.is_some();
@@ -651,9 +655,11 @@ async fn get_weather_handler(State(state): State<Arc<AppState>>) -> Json<Value> 
             "data": outcome,
         }))
     } else {
-        Json(json!({
-            "status": "no_data",
-        }))
+        let error = state.weather_error_latest.lock().await.clone();
+        match error {
+            Some(message) => Json(json!({ "status": "error", "message": message })),
+            None => Json(json!({ "status": "no_data" })),
+        }
     }
 }
 
@@ -745,6 +751,7 @@ async fn run_price_cycle(state: &AppState) -> Result<()> {
         // Store the raw ElectricityPriceOutcome JSON
         let mut guard = state.prices_latest.lock().await;
         *guard = Some(outcome);
+        *state.prices_error_latest.lock().await = None;
     } else {
         println!("[priceOutcome] jobId={job_id}, no ElectricityPriceOutcome");
     }
@@ -754,17 +761,19 @@ async fn run_price_cycle(state: &AppState) -> Result<()> {
 }
 
 async fn hourly_price_loop(state: Arc<AppState>) {
-    // First fetch right away
-    if let Err(e) = run_price_cycle(&state).await {
-        eprintln!("[price hourly] first price fetch failed: {e:?}");
-    }
-
-    let mut ticker = interval(Duration::from_secs(60 * 60));
     loop {
-        ticker.tick().await;
         if let Err(e) = run_price_cycle(&state).await {
             eprintln!("[price hourly] price fetch failed: {e:?}");
+            *state.prices_error_latest.lock().await = Some(e.to_string());
         }
+
+        let has_price_data = state.prices_latest.lock().await.is_some();
+        let delay = if has_price_data {
+            Duration::from_secs(60 * 60)
+        } else {
+            Duration::from_secs(30)
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -796,9 +805,11 @@ async fn get_prices_handler(State(state): State<Arc<AppState>>) -> Json<Value> {
             "data": outcome,
         }))
     } else {
-        Json(json!({
-            "status": "no_data",
-        }))
+        let error = state.prices_error_latest.lock().await.clone();
+        match error {
+            Some(message) => Json(json!({ "status": "error", "message": message })),
+            None => Json(json!({ "status": "no_data" })),
+        }
     }
 }
 
@@ -827,10 +838,12 @@ async fn main() -> Result<()> {
         weather_task: Arc::new(Mutex::new(None)),
         price_task: Arc::new(Mutex::new(None)),
         prices_latest: Arc::new(Mutex::new(None)),
+        prices_error_latest: Arc::new(Mutex::new(None)),
         control_signals_latest: Arc::new(Mutex::new(None)),
         ha_base_url,
         ha_token,
         weather_latest: Arc::new(Mutex::new(None)),
+        weather_error_latest: Arc::new(Mutex::new(None)),
     });
 
     let cors = CorsLayer::new()
