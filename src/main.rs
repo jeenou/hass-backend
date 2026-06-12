@@ -27,6 +27,7 @@ use tokio::{
 use std::path::Path as StdPath;
 
 const OPERATIONS: &str = include_str!("operations.graphql");
+const CONTROL_SIGNAL_STEP: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone)]
 struct AppState {
@@ -34,6 +35,7 @@ struct AppState {
     graphql_url: String,
     optimization_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     optimization_cycle: Arc<Mutex<()>>,
+    control_signal_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     weather_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     price_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     prices_latest: Arc<Mutex<Option<Value>>>,
@@ -119,6 +121,37 @@ async fn save_model(client: &Client, graphql_url: &str) -> Result<()> {
     }
 
     println!("[saveModel] OK");
+    Ok(())
+}
+
+async fn set_optimization_timeline(client: &Client, graphql_url: &str) -> Result<()> {
+    let resp = graphql_request(
+        client,
+        graphql_url,
+        OPERATIONS,
+        Some("SetOptimizationTimeline"),
+        json!({}),
+    )
+    .await?;
+
+    if let Some(errors) = resp.get("errors") {
+        return Err(anyhow!(
+            "GraphQL errors in SetOptimizationTimeline: {errors:#?}"
+        ));
+    }
+
+    let validation_errors = resp
+        .pointer("/data/updateTimeLine/errors")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("SetOptimizationTimeline returned an invalid response"))?;
+
+    if !validation_errors.is_empty() {
+        return Err(anyhow!(
+            "SetOptimizationTimeline validation errors: {validation_errors:#?}"
+        ));
+    }
+
+    println!("[timeline] 12-hour horizon with 15-minute steps");
     Ok(())
 }
 
@@ -232,6 +265,78 @@ async fn get_optimization_outcome(
     Ok(Some(outcome.clone()))
 }
 
+async fn schedule_control_signals(state: &AppState, signals: &Value) {
+    let Some(arr) = signals.as_array() else {
+        return;
+    };
+
+    let mut device_signals = std::collections::HashMap::<String, Vec<f64>>::new();
+    for sig in arr {
+        let Some(signal_name) = sig.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(values) = sig.get("signal").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if !signal_name.contains("_electricitygrid_") {
+            continue;
+        }
+
+        let entity_id = extract_entity_id(signal_name);
+        if entity_id.is_empty() {
+            continue;
+        }
+
+        let target = device_signals.entry(entity_id).or_default();
+        if target.len() < values.len() {
+            target.resize(values.len(), 0.0);
+        }
+        for (index, value) in values.iter().enumerate() {
+            if let Some(value) = value.as_f64() {
+                target[index] += value;
+            }
+        }
+    }
+
+    let mut task_guard = state.control_signal_task.lock().await;
+    if let Some(handle) = task_guard.take() {
+        handle.abort();
+    }
+    if device_signals.is_empty() {
+        return;
+    }
+
+    let client = state.client.clone();
+    let base_url = state.ha_base_url.clone();
+    let api_key = state.ha_token.clone();
+    *task_guard = Some(tokio::spawn(async move {
+        let step_count = device_signals
+            .values()
+            .map(|values| values.len())
+            .max()
+            .unwrap_or(0);
+
+        for step in 0..step_count {
+            for (entity_id, values) in &device_signals {
+                let value = values.get(step).copied().unwrap_or(0.0);
+                println!(
+                    "[HA schedule] step={step}, raw={value}, binary={}, entity={entity_id}",
+                    if value > 1e-6 { "ON" } else { "OFF" }
+                );
+                if let Err(error) =
+                    send_control_signal(&client, &base_url, &api_key, entity_id, value).await
+                {
+                    eprintln!("[HA schedule] error sending to {entity_id}: {error}");
+                }
+            }
+
+            if step + 1 < step_count {
+                sleep(CONTROL_SIGNAL_STEP).await;
+            }
+        }
+    }));
+}
+
 /// One full optimisation cycle + send signals to HA.
 async fn run_one_cycle(state: &AppState) -> Result<()> {
     let _cycle_guard = state.optimization_cycle.lock().await;
@@ -240,6 +345,7 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
     let client = &state.client;
     let graphql_url = &state.graphql_url;
 
+    set_optimization_timeline(client, graphql_url).await?;
     save_model(client, graphql_url).await?;
 
     let job_id = start_optimization(client, graphql_url).await?;
@@ -270,52 +376,7 @@ async fn run_one_cycle(state: &AppState) -> Result<()> {
             *guard = Some(outcome);
         }
 
-        // ----- Send to Home Assistant -----
-        // New AppState: token is always available (read from env in main, passed into AppState)
-        let api_key = &state.ha_token;
-        let base_url = &state.ha_base_url;
-
-        if let Some(arr) = cs.as_array() {
-            let mut device_signals = std::collections::HashMap::<String, f64>::new();
-
-            for sig in arr {
-                let name = sig.get("name").and_then(|v| v.as_str());
-                let values = sig.get("signal").and_then(|v| v.as_array());
-                if name.is_none() || values.is_none() {
-                    continue;
-                }
-
-                let signal_name = name.unwrap();
-                if !signal_name.contains("_electricitygrid_") {
-                    continue;
-                }
-
-                let entity_id = extract_entity_id(signal_name);
-                if entity_id.is_empty() {
-                    continue;
-                }
-
-                if let Some(first_value) = values.unwrap().get(0).and_then(|v| v.as_f64()) {
-                    *device_signals.entry(entity_id).or_insert(0.0) += first_value;
-                }
-            }
-
-            for (entity_id, value) in device_signals {
-                println!("[HA] Sending {value} to {entity_id}");
-                if let Err(e) = send_control_signal(
-                    &state.client,
-                    base_url,
-                    api_key,
-                    &entity_id,
-                    value,
-                )
-                .await
-                {
-                    eprintln!("[HA] error sending to {}: {}", entity_id, e);
-                }
-            }
-        }
-        // -----------------------------------
+        schedule_control_signals(state, &cs).await;
     } else {
         println!("[jobOutcome] jobId={job_id}, no OptimizationOutcome/controlSignals");
     }
@@ -481,6 +542,9 @@ async fn stop_hourly_handler(State(state): State<Arc<AppState>>) -> Json<Value> 
 
     if let Some(handle) = guard.take() {
         handle.abort();
+        if let Some(control_handle) = state.control_signal_task.lock().await.take() {
+            control_handle.abort();
+        }
         return Json(json!({ "status": "stopped" }));
     }
 
@@ -837,6 +901,7 @@ async fn main() -> Result<()> {
         graphql_url,
         optimization_task: Arc::new(Mutex::new(None)),
         optimization_cycle: Arc::new(Mutex::new(())),
+        control_signal_task: Arc::new(Mutex::new(None)),
         weather_task: Arc::new(Mutex::new(None)),
         price_task: Arc::new(Mutex::new(None)),
         prices_latest: Arc::new(Mutex::new(None)),

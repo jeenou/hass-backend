@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 /// Valid HA domains we support.
 static VALID_DOMAINS: &[&str] = &["switch", "light", "climate", "number", "fan", "cover"];
+const ON_SIGNAL_EPSILON: f64 = 1e-6;
 
 /// Extract a Home Assistant `entity_id` from a raw control signal name.
 /// Handles various naming formats used by your optimization model.
@@ -96,7 +97,7 @@ pub async fn send_control_signal(
 
     let (service, payload) = match domain {
         "switch" | "light" => {
-            let service = if value > 0.0 { "turn_on" } else { "turn_off" };
+            let service = if value > ON_SIGNAL_EPSILON { "turn_on" } else { "turn_off" };
             (
                 service.to_string(),
                 json!({ "entity_id": entity_id }),
@@ -112,7 +113,7 @@ pub async fn send_control_signal(
             )
         }
         _ => {
-            let service = if value > 0.0 { "turn_on" } else { "turn_off" };
+            let service = if value > ON_SIGNAL_EPSILON { "turn_on" } else { "turn_off" };
             (
                 service.to_string(),
                 json!({ "entity_id": entity_id }),

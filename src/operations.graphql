@@ -5,6 +5,22 @@ mutation SaveModel {
   }
 }
 
+# Keep existing configured models aligned with the add-on's thermal model step.
+mutation SetOptimizationTimeline {
+  updateTimeLine(
+    timeLineInput: {
+      duration: { hours: 12, minutes: 0, seconds: 0 }
+      step: { hours: 0, minutes: 15, seconds: 0 }
+      start: { clockChoice: CURRENT_HOUR }
+    }
+  ) {
+    errors {
+      field
+      message
+    }
+  }
+}
+
 # StartOptimization mutation
 mutation StartOptimization {
   startOptimization
